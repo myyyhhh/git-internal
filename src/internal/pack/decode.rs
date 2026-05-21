@@ -41,6 +41,17 @@ use crate::{
     zstdelta,
 };
 
+/// Pack文件对象统计信息
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackStats {
+    pub total: usize,
+    pub commits: usize,
+    pub trees: usize,
+    pub blobs: usize,
+    pub tags: usize,
+    pub deltas: usize,
+}
+
 /// A reader that counts bytes read and computes CRC32 checksum.
 /// which is used to verify the integrity of decompressed data.
 struct CrcCountingReader<'a, R> {
@@ -400,15 +411,18 @@ impl Pack {
     /// # Parameters
     /// * pack_id_callback: A callback that seed pack_file sha1 for updating database
     ///
-    pub fn decode<F, C>(
+    pub fn decode_with_raw_callback<F, C, R>(
         &mut self,
         pack: &mut (impl BufRead + Send),
         callback: F,
         pack_id_callback: Option<C>,
+
+        mut raw_object_callback: Option<R>, // 新增：原始对象回调，用于统计delta
     ) -> Result<(), GitError>
     where
         F: Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send + 'static,
         C: FnOnce(ObjectHash) + Send + 'static,
+        R: FnMut(&CacheObject) + Send + 'static,
     {
         let time = Instant::now();
         let mut last_update_time = time.elapsed().as_millis();
@@ -463,6 +477,12 @@ impl Pack {
                 Pack::decode_pack_object(&mut reader, &mut offset);
             match r {
                 Ok(Some(mut obj)) => {
+                    // NEW
+                    // 统计delta对象大小
+                    if let Some(ref mut f) = raw_object_callback {
+                        (*f)(&obj);
+                    }
+
                     obj.set_mem_recorder(self.cache_objs_mem.clone());
                     obj.record_mem_size();
 
@@ -563,6 +583,26 @@ impl Pack {
         Ok(())
     }
 
+    // 兼容原有API的decode函数
+    pub fn decode<F, C>(
+        &mut self,
+        pack: &mut (impl BufRead + Send),
+        callback: F,
+        pack_id_callback: Option<C>,
+    ) -> Result<(), GitError>
+    where
+        F: Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send + 'static,
+        C: FnOnce(ObjectHash) + Send + 'static,
+    {
+        // 内部调用带回调的版本，传入None作为默认值
+        self.decode_with_raw_callback(
+            pack,
+            callback,
+            pack_id_callback,
+            None::<fn(&CacheObject)>, // 传入None
+        )
+    }
+
     /// Decode a Pack in a new thread and send the CacheObjects while decoding.
     /// <br> Attention: It will consume the `pack` and return in a JoinHandle.
     pub fn decode_async(
@@ -631,6 +671,110 @@ impl Pack {
         })
         .await
         .unwrap()
+    }
+
+  
+    /// 使用Hook，统计pack文件中的对象数量和类型分布
+    pub fn stats_pack_file_hook(path: &std::path::Path) -> Result<PackStats, GitError> {
+        use std::fs::File;
+        use std::io::BufReader;
+        use std::sync::{Arc, Mutex};
+
+        // 打开pack文件
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        // 创建Pack实例
+        let mut pack = Pack::new(Some(1), None, None, true);
+
+        // 只需要一个共享状态（推荐直接手写初始化，防止没派生 Default）
+        let stats = Arc::new(Mutex::new(PackStats {
+            total: 0, commits: 0, trees: 0, blobs: 0, tags: 0, deltas: 0,
+        }));
+        let stats_clone = stats.clone();
+
+        // 调用带原始对象回调的解码方法
+        pack.decode_with_raw_callback(
+            &mut reader,
+            
+            // 1. 完整对象回调：直接留空！
+            // 因为我们不需要统计还原后的对象，彻底放弃它
+            |_| {}, 
+            
+            None::<fn(ObjectHash)>,
+            
+            // 2. 原始对象回调：在这里完成【所有】的物理统计
+            Some(move |obj: &CacheObject| {
+                let mut s = stats_clone.lock().unwrap();
+                s.total += 1; // 物理对象总数 + 1
+                
+                match obj.info {
+                    // 如果是基础物理对象，分类统计
+                    CacheObjectInfo::BaseObject(t, _) => match t {
+                        ObjectType::Commit => s.commits += 1,
+                        ObjectType::Tree => s.trees += 1,
+                        ObjectType::Blob => s.blobs += 1,
+                        ObjectType::Tag => s.tags += 1,
+                        _ => {}
+                    },
+                    // 如果是 Delta 物理对象，单独统计
+                    CacheObjectInfo::OffsetDelta(_, _)
+                    | CacheObjectInfo::OffsetZstdelta(_, _)
+                    | CacheObjectInfo::HashDelta(_, _) => {
+                        s.deltas += 1;
+                    }
+                }
+            }),
+        )?;
+
+        // 直接提取最终结果返回
+        let final_stats = stats.lock().unwrap();
+        Ok(*final_stats)
+    }
+    /// 工具函数：统计 Pack 文件中的对象分布
+    pub fn stat_pack_file<P: AsRef<std::path::Path>>(path: P) -> Result<PackStats, GitError> {
+        // 1. 打开文件并包装为 BufReader
+        let file = std::fs::File::open(path)
+            .map_err(|e| GitError::InvalidPackFile(format!("Failed to open pack file: {}", e)))?;
+        let mut reader = std::io::BufReader::new(file);
+
+        // 2. 复用 check_header 读取并校验头部，获取对象总数
+        let (object_num, _) = Pack::check_header(&mut reader)?;
+
+        let mut stats = PackStats {
+            total: object_num as usize,
+            commits: 0,
+            trees: 0,
+            blobs: 0,
+            tags: 0,
+            deltas: 0,
+        };
+
+        // 头部固定 12 字节
+        let mut offset = 12;
+
+        // 3. 循环解析每一个对象
+        for _ in 0..object_num {
+            // 复用 decode_pack_object，它会帮我们解压并返回对象的元数据信息
+            if let Some(obj) = Pack::decode_pack_object(&mut reader, &mut offset)? {
+                match obj.info {
+                    CacheObjectInfo::BaseObject(obj_type, _) => match obj_type {
+                        ObjectType::Commit => stats.commits += 1,
+                        ObjectType::Tree => stats.trees += 1,
+                        ObjectType::Blob => stats.blobs += 1,
+                        ObjectType::Tag => stats.tags += 1,
+                        _ => {}
+                    },
+                    CacheObjectInfo::OffsetDelta(_, _)
+                    | CacheObjectInfo::OffsetZstdelta(_, _)
+                    | CacheObjectInfo::HashDelta(_, _) => {
+                        stats.deltas += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(stats)
     }
 
     /// CacheObjects + Index size of Caches
@@ -1051,4 +1195,175 @@ mod tests {
             }
         });
     }
+
+    // ==========================================================
+    // -------------------实验新增测试---------------------------
+    // ==========================================================
+    #[test]
+    fn test_stat_pack_file_normal() {
+        // 使用原文件 tests 模块中自带的辅助函数，保证一定能拿到有效的 pack 文件
+        let (source, _guard) = download_pack_file("small-sha1.pack");
+
+        // 2. 调用我们编写的统计工具函数
+        let stats_result = Pack::stat_pack_file(&source);
+        assert!(stats_result.is_ok(), "正常 pack 文件解析不应该报错");
+        
+        let stats = stats_result.unwrap();
+
+        // 3. 核心断言：校验统计逻辑是否守恒（总数 = 各类对象之和）
+        assert_eq!(
+            stats.total,
+            stats.commits + stats.trees + stats.blobs + stats.tags + stats.deltas,
+            "对象总数应该等于各项对象分类数量之和"
+        );
+        
+        // 确保文件确实包含对象，防止解析出 0
+        assert!(stats.total > 0, "Pack文件中的对象总数不应该为0");
+        
+        // 打印结果，方便使用 --nocapture 查看
+        println!("Pack File: {:?}", source.file_name().unwrap());
+        println!("Stats: {:#?}", stats);
+    }
+
+    #[test]
+    fn test_stat_pack_file_error_not_found() {
+        // 错误路径测试 1：测试文件不存在的情况
+        let fake_path = "tests/data/packs/this_file_does_not_exist.pack";
+        let result = Pack::stat_pack_file(fake_path);
+        
+        // 断言：应当返回错误
+        assert!(result.is_err(), "文件不存在时应当返回 GitError");
+    }
+
+    #[test]
+    fn test_stat_pack_file_error_invalid_format() {
+        // 错误路径测试 2：测试文件格式非法的情况 (模拟错误的 Magic Number)
+        let tmp_dir = std::env::temp_dir();
+        let invalid_pack_path = tmp_dir.join("invalid_test.pack");
+        
+        // 写入错误的数据（非 "PACK" 开头）
+        let mut file = fs::File::create(&invalid_pack_path).unwrap();
+        file.write_all(b"WRONG_HEADER_DATA").unwrap();
+
+        let result = Pack::stat_pack_file(&invalid_pack_path);
+        
+        // 断言：应当抛出错误，因为 check_header 会发现这不是个合法的 Pack 文件
+        assert!(result.is_err(), "文件格式非法时应当返回 GitError");
+
+        // 测试完毕后清理临时文件
+        fs::remove_file(invalid_pack_path).unwrap();
+    }
+
+
+
+    // ----------------------------------------------------------
+    // #[test]
+    // fn test_stat_pack_file_normal() {
+    //     let _guard = set_hash_kind_for_test(HashKind::Sha1);
+    //     let (source, _guard) = download_pack_file("small-sha1.pack");
+    //
+    //     let stats_result = Pack::stat_pack_file(&source);
+    //     assert!(stats_result.is_ok(), "正常pack文件解析不应该报错");
+    //  
+    //     let stats = stats_result.unwrap();
+    //
+    //     // 核心守恒断言
+    //     assert_eq!(
+    //         stats.total,
+    //         stats.commits + stats.trees + stats.blobs + stats.tags + stats.deltas,
+    //         "对象总数应该等于各项对象分类数量之和"
+    //     );
+    //    
+    //     assert!(stats.total > 0, "Pack文件中的对象总数不应该为0");
+    //        
+    //     // 打印结果方便调试
+    //     println!("\n=== stat_pack_file 测试结果 ===");
+    //     println!("Pack File: {:?}", source.file_name().unwrap());
+    //     println!("Stats: {:#?}", stats);
+    // }
+    //  
+    // #[test]
+    // fn test_stat_pack_file_error_not_found() {
+    //     let fake_path = "tests/data/packs/this_file_does_not_exist_123.pack";
+    //     let result = Pack::stat_pack_file(fake_path);
+    //        
+    //     assert!(result.is_err(), "文件不存在时应当返回GitError");
+    //     assert!(
+    //         result.unwrap_err().to_string().contains("系统找不到指定的文件"),
+    //         "错误信息应该包含文件不存在提示"
+    //     );
+    // }
+    //
+    // #[test]
+    // fn test_stat_pack_file_error_invalid_format() {
+    //     let tmp_dir = std::env::temp_dir();
+    //     let invalid_pack_path = tmp_dir.join("invalid_stat_test.pack");
+    //        
+    //     // 写入非法头部
+    //     let mut file = fs::File::create(&invalid_pack_path).unwrap();
+    //     file.write_all(b"INVALID_PACK_HEADER_123456").unwrap();
+    //
+    //     let result = Pack::stat_pack_file(&invalid_pack_path);
+    //        
+    //     assert!(result.is_err(), "文件格式非法时应当返回GitError");
+    //     assert!(
+    //         result.unwrap_err().to_string().contains("InvalidPackHeader"),
+    //         "错误信息应该包含无效头部提示"
+    //     );
+    //
+    //     fs::remove_file(invalid_pack_path).unwrap();
+    // }
+    //
+    // // ======================================
+    // // 2. 测试复用Decode回调版：stats_pack_file_hook
+    // // ======================================
+    // #[test]
+    // fn test_stats_pack_file_hook_normal() {
+    //     let _guard = set_hash_kind_for_test(HashKind::Sha1);
+    //     let (source, _guard) = download_pack_file("small-sha1.pack");
+    //
+    //     let stats_result = Pack::stats_pack_file_hook(&source);
+    //     assert!(stats_result.is_ok(), "正常pack文件解析不应该报错");
+    //        
+    //     let stats = stats_result.unwrap();
+    //
+    //     // 核心守恒断言
+    //     assert_eq!(
+    //         stats.total,
+    //         stats.commits + stats.trees + stats.blobs + stats.tags,
+    //         "复用Decode版：对象总数应该等于完整对象数量之和"
+    //     );
+    //       
+    //     assert!(stats.total > 0, "Pack文件中的对象总数不应该为0");
+    //     assert!(stats.deltas >= 0, "Delta对象数量不能为负数");
+    //        
+    //     // 打印结果方便调试
+    //     println!("\n=== stats_pack_file_hook 测试结果 ===");
+    //     println!("Pack File: {:?}", source.file_name().unwrap());
+    //     println!("Stats: {:#?}", stats);
+    // }
+    //
+    // #[test]
+    // fn test_stats_pack_file_hook_error_not_found() {
+    //     let fake_path = "tests/data/packs/this_file_does_not_exist_456.pack";
+    //     let result = Pack::stats_pack_file_hook(fake_path);
+    //
+    //     assert!(result.is_err(), "文件不存在时应当返回GitError");
+    // }
+    //
+    // #[test]
+    // fn test_stats_pack_file_hook_error_invalid_format() {
+    //     let tmp_dir = std::env::temp_dir();
+    //     let invalid_pack_path = tmp_dir.join("invalid_hook_test.pack");
+    //
+    //     let mut file = fs::File::create(&invalid_pack_path).unwrap();
+    //     file.write_all(b"WRONG_MAGIC_NUMBER_789").unwrap();
+    //
+    //     let result = Pack::stats_pack_file_hook(&invalid_pack_path);
+    //  
+    //     assert!(result.is_err(), "文件格式非法时应当返回GitError");
+    //
+    //     fs::remove_file(invalid_pack_path).unwrap();
+    // }
+
 }
