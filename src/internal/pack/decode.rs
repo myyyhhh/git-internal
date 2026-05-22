@@ -405,12 +405,7 @@ impl Pack {
         }
     }
 
-    /// Decodes a pack file from a given Read and BufRead source, for each object in the pack,
-    /// it decodes the object and processes it using the provided callback function.
-    ///
-    /// # Parameters
-    /// * pack_id_callback: A callback that seed pack_file sha1 for updating database
-    ///
+    // 重构decode函数
     pub fn decode_with_raw_callback<F, C, R>(
         &mut self,
         pack: &mut (impl BufRead + Send),
@@ -422,7 +417,7 @@ impl Pack {
     where
         F: Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send + 'static,
         C: FnOnce(ObjectHash) + Send + 'static,
-        R: FnMut(&CacheObject) + Send + 'static,
+        R: FnMut(&CacheObject),
     {
         let time = Instant::now();
         let mut last_update_time = time.elapsed().as_millis();
@@ -673,66 +668,49 @@ impl Pack {
         .unwrap()
     }
 
-  
     /// 使用Hook，统计pack文件中的对象数量和类型分布
-    pub fn stats_pack_file_hook(path: &std::path::Path) -> Result<PackStats, GitError> {
+    pub fn stats_pack_file_hook<P: AsRef<std::path::Path>>(path: P) -> Result<PackStats, GitError> {
         use std::fs::File;
         use std::io::BufReader;
-        use std::sync::{Arc, Mutex};
 
-        // 打开pack文件
-        let file = File::open(path)?;
+        // 统一错误处理，和stat_pack_file保持一致
+        let file = File::open(path)
+            .map_err(|e| GitError::InvalidPackFile(format!("Failed to open pack file: {}", e)))?;
         let mut reader = BufReader::new(file);
 
-        // 创建Pack实例
         let mut pack = Pack::new(Some(1), None, None, true);
+        let mut stats = PackStats::default();
 
-        // 只需要一个共享状态（推荐直接手写初始化，防止没派生 Default）
-        let stats = Arc::new(Mutex::new(PackStats {
-            total: 0, commits: 0, trees: 0, blobs: 0, tags: 0, deltas: 0,
-        }));
-        let stats_clone = stats.clone();
-
-        // 调用带原始对象回调的解码方法
         pack.decode_with_raw_callback(
             &mut reader,
-            
-            // 1. 完整对象回调：直接留空！
-            // 因为我们不需要统计还原后的对象，彻底放弃它
-            |_| {}, 
-            
+            |_| {},
             None::<fn(ObjectHash)>,
-            
-            // 2. 原始对象回调：在这里完成【所有】的物理统计
-            Some(move |obj: &CacheObject| {
-                let mut s = stats_clone.lock().unwrap();
-                s.total += 1; // 物理对象总数 + 1
-                
+            // 闭包直接捕获外部的 &mut stats
+            Some(|obj: &CacheObject| {
+                stats.total += 1;
+
                 match obj.info {
-                    // 如果是基础物理对象，分类统计
                     CacheObjectInfo::BaseObject(t, _) => match t {
-                        ObjectType::Commit => s.commits += 1,
-                        ObjectType::Tree => s.trees += 1,
-                        ObjectType::Blob => s.blobs += 1,
-                        ObjectType::Tag => s.tags += 1,
+                        ObjectType::Commit => stats.commits += 1,
+                        ObjectType::Tree => stats.trees += 1,
+                        ObjectType::Blob => stats.blobs += 1,
+                        ObjectType::Tag => stats.tags += 1,
                         _ => {}
                     },
-                    // 如果是 Delta 物理对象，单独统计
                     CacheObjectInfo::OffsetDelta(_, _)
                     | CacheObjectInfo::OffsetZstdelta(_, _)
                     | CacheObjectInfo::HashDelta(_, _) => {
-                        s.deltas += 1;
+                        stats.deltas += 1;
                     }
                 }
             }),
         )?;
 
-        // 直接提取最终结果返回
-        let final_stats = stats.lock().unwrap();
-        Ok(*final_stats)
+        // 返回统计结果
+        Ok(stats)
     }
     /// 工具函数：统计 Pack 文件中的对象分布
-    pub fn stat_pack_file<P: AsRef<std::path::Path>>(path: P) -> Result<PackStats, GitError> {
+    pub fn stats_pack_file<P: AsRef<std::path::Path>>(path: P) -> Result<PackStats, GitError> {
         // 1. 打开文件并包装为 BufReader
         let file = std::fs::File::open(path)
             .map_err(|e| GitError::InvalidPackFile(format!("Failed to open pack file: {}", e)))?;
@@ -1204,23 +1182,23 @@ mod tests {
         // 使用原文件 tests 模块中自带的辅助函数，保证一定能拿到有效的 pack 文件
         let (source, _guard) = download_pack_file("small-sha1.pack");
 
-        // 2. 调用我们编写的统计工具函数
-        let stats_result = Pack::stat_pack_file(&source);
+        // 调用统计工具函数
+        let stats_result = Pack::stats_pack_file(&source);
         assert!(stats_result.is_ok(), "正常 pack 文件解析不应该报错");
-        
+
         let stats = stats_result.unwrap();
 
-        // 3. 核心断言：校验统计逻辑是否守恒（总数 = 各类对象之和）
+        // 断言，校验统计逻辑是否总数 = 各类对象之和
         assert_eq!(
             stats.total,
             stats.commits + stats.trees + stats.blobs + stats.tags + stats.deltas,
             "对象总数应该等于各项对象分类数量之和"
         );
-        
+
         // 确保文件确实包含对象，防止解析出 0
         assert!(stats.total > 0, "Pack文件中的对象总数不应该为0");
-        
-        // 打印结果，方便使用 --nocapture 查看
+
+        // 打印结果，使用 --nocapture 查看
         println!("Pack File: {:?}", source.file_name().unwrap());
         println!("Stats: {:#?}", stats);
     }
@@ -1229,9 +1207,12 @@ mod tests {
     fn test_stat_pack_file_error_not_found() {
         // 错误路径测试 1：测试文件不存在的情况
         let fake_path = "tests/data/packs/this_file_does_not_exist.pack";
-        let result = Pack::stat_pack_file(fake_path);
-        
-        // 断言：应当返回错误
+        let result = Pack::stats_pack_file(fake_path);
+
+        // 打印结果，使用 --nocapture 查看
+        eprintln!("\n[DEBUG] 执行结果: {:?}", result);
+
+        // 断言，返回错误
         assert!(result.is_err(), "文件不存在时应当返回 GitError");
     }
 
@@ -1240,13 +1221,16 @@ mod tests {
         // 错误路径测试 2：测试文件格式非法的情况 (模拟错误的 Magic Number)
         let tmp_dir = std::env::temp_dir();
         let invalid_pack_path = tmp_dir.join("invalid_test.pack");
-        
+
         // 写入错误的数据（非 "PACK" 开头）
         let mut file = fs::File::create(&invalid_pack_path).unwrap();
         file.write_all(b"WRONG_HEADER_DATA").unwrap();
 
-        let result = Pack::stat_pack_file(&invalid_pack_path);
-        
+        let result = Pack::stats_pack_file(&invalid_pack_path);
+
+        // 打印结果，使用 --nocapture 查看
+        eprintln!("\n[DEBUG] 执行结果: {:?}", result);
+
         // 断言：应当抛出错误，因为 check_header 会发现这不是个合法的 Pack 文件
         assert!(result.is_err(), "文件格式非法时应当返回 GitError");
 
@@ -1254,9 +1238,159 @@ mod tests {
         fs::remove_file(invalid_pack_path).unwrap();
     }
 
+    #[test]
+    fn test_stats_pack_file_hook_normal() {
+        // 使用原文件 tests 模块中自带的辅助函数，保证一定能拿到有效的 pack 文件
+        let (source, _guard) = download_pack_file("small-sha1.pack");
+
+        // 调用基于Hook的统计工具函数
+        let stats_result = Pack::stats_pack_file_hook(&source);
+        assert!(stats_result.is_ok(), "正常 pack 文件解析不应该报错");
+
+        let stats = stats_result.unwrap();
+
+        // 核心断言1：校验统计逻辑守恒，总数 = 各类对象之和
+        assert_eq!(
+            stats.total,
+            stats.commits + stats.trees + stats.blobs + stats.tags + stats.deltas,
+            "对象总数应该等于各项对象分类数量之和"
+        );
+
+        // 核心断言2：确保文件确实包含对象，防止解析出 0
+        assert!(stats.total > 0, "Pack文件中的对象总数不应该为0");
+
+        // 打印结果，使用 --nocapture 查看
+        println!("Pack File: {:?}", source.file_name().unwrap());
+        println!("Stats: {:#?}", stats);
+    }
+
+    #[test]
+    fn test_stats_pack_file_hook_error_not_found() {
+        // 错误路径测试 1：测试文件不存在的情况
+        let fake_path = "tests/data/packs/this_file_does_not_exist_hook.pack";
+        let result = Pack::stats_pack_file_hook(fake_path);
+
+        // 打印调试信息，使用 --nocapture 查看
+        eprintln!(
+            "\n[DEBUG] stats_pack_file_hook 文件不存在测试结果: {:?}",
+            result
+        );
+
+        // 断言：文件不存在时应当返回 GitError
+        assert!(result.is_err(), "文件不存在时应当返回 GitError");
+        // 可选：断言错误信息包含指定内容（更严格）
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to open pack file"),
+            "错误信息应该包含文件打开失败提示"
+        );
+    }
+
+    #[test]
+    fn test_stats_pack_file_hook_error_invalid_format() {
+        // 错误路径测试 2：测试文件格式非法的情况 (模拟错误的 Magic Number)
+        let tmp_dir = std::env::temp_dir();
+        let invalid_pack_path = tmp_dir.join("invalid_hook_test.pack");
+
+        // 写入错误的数据（非 "PACK" 开头）
+        let mut file = fs::File::create(&invalid_pack_path).unwrap();
+        file.write_all(b"WRONG_HOOK_HEADER_DATA_123456").unwrap();
+
+        let result = Pack::stats_pack_file_hook(&invalid_pack_path);
+
+        // 打印调试信息，使用 --nocapture 查看
+        eprintln!(
+            "\n[DEBUG] stats_pack_file_hook 非法格式测试结果: {:?}",
+            result
+        );
+
+        // 断言：应当抛出错误，因为 check_header 会发现这不是个合法的 Pack 文件
+        assert!(result.is_err(), "文件格式非法时应当返回 GitError");
+        // 可选：断言错误类型是无效头部
+        assert!(
+            format!("{:?}", result.unwrap_err()).contains("InvalidPackHeader"),
+            "错误信息应该包含无效头部提示"
+        );
+
+        // 测试完毕后清理临时文件
+        fs::remove_file(invalid_pack_path).unwrap();
+    }
 
 
-    // ----------------------------------------------------------
+    // ------------------- 交叉一致性验证测试-------------------
+    #[test]
+    fn test_both_methods_consistency() {
+        // 同时测试 SHA1 和 SHA256 两种哈希类型的 Pack 文件
+        let test_cases = [
+            ("small-sha1.pack", HashKind::Sha1),
+            ("small-sha256.pack", HashKind::Sha256),
+            ("medium-sha1.pack", HashKind::Sha1),
+        ];
+
+        for (filename, hash_kind) in test_cases {
+            // 为当前测试文件设置正确的哈希类型
+            let _hash_guard = set_hash_kind_for_test(hash_kind);
+
+            let (source, _dl_guard) = download_pack_file(filename);
+            println!("\n=== 交叉验证: {} ({:?}) ===", filename, hash_kind);
+
+            // 分别调用两种统计方法
+            let stats_light = Pack::stats_pack_file(&source).expect("轻量直读法解析失败");
+            let stats_hook = Pack::stats_pack_file_hook(&source).expect("Hook法解析失败");
+
+            // 打印两个结果用于对比
+            println!("轻量直读法结果: {:#?}", stats_light);
+            println!("Hook法结果: {:#?}", stats_hook);
+
+            // 断言：两个完全独立的实现必须返回完全相同的结果
+            assert_eq!(
+                stats_light, stats_hook,
+                "两种统计方法的结果必须一致！文件: {}",
+                filename
+            );
+
+            println!("✅ {} 交叉验证通过", filename);
+        }
+    }
+
+    #[test]
+    fn test_performance_comparison() {
+        // 使用 medium 大小的包进行性能测试，差异更明显
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let (source, _dl_guard) = download_pack_file("medium-sha1.pack");
+
+        println!("\n=== Pack Decode 统计方法性能对比 ===");
+
+        // 1. 测试基于轻量循环的方法
+        let start_light = std::time::Instant::now();
+        let stats_light = Pack::stats_pack_file(&source).expect("轻量方法解析失败");
+        let duration_light = start_light.elapsed();
+
+        println!(
+            "轻量直读法 (stat_pack_file) 耗时: {:.3?} | 总对象数: {}",
+            duration_light, stats_light.total
+        );
+
+        // 2. 测试基于全流程 Hook 的方法
+        let start_hook = std::time::Instant::now();
+        let stats_hook = Pack::stats_pack_file_hook(&source).expect("Hook方法解析失败");
+        let duration_hook = start_hook.elapsed();
+
+        println!(
+            "全流程Hook法 (stats_pack_file_hook) 耗时: {:.3?} | 总对象数: {}",
+            duration_hook, stats_hook.total
+        );
+
+        // 断言两种方法统计出的数据绝对一致
+        assert_eq!(stats_light, stats_hook, "两种方法统计结果必须一致");
+
+        // 打印倍数差异
+        let ratio = duration_hook.as_secs_f64() / duration_light.as_secs_f64();
+        println!("结论: 轻量直读法比 Hook 法快约 {:.2} 倍\n", ratio);
+    }
+
     // #[test]
     // fn test_stat_pack_file_normal() {
     //     let _guard = set_hash_kind_for_test(HashKind::Sha1);
@@ -1264,7 +1398,7 @@ mod tests {
     //
     //     let stats_result = Pack::stat_pack_file(&source);
     //     assert!(stats_result.is_ok(), "正常pack文件解析不应该报错");
-    //  
+    //
     //     let stats = stats_result.unwrap();
     //
     //     // 核心守恒断言
@@ -1273,20 +1407,20 @@ mod tests {
     //         stats.commits + stats.trees + stats.blobs + stats.tags + stats.deltas,
     //         "对象总数应该等于各项对象分类数量之和"
     //     );
-    //    
+    //
     //     assert!(stats.total > 0, "Pack文件中的对象总数不应该为0");
-    //        
+    //
     //     // 打印结果方便调试
     //     println!("\n=== stat_pack_file 测试结果 ===");
     //     println!("Pack File: {:?}", source.file_name().unwrap());
     //     println!("Stats: {:#?}", stats);
     // }
-    //  
+    //
     // #[test]
     // fn test_stat_pack_file_error_not_found() {
     //     let fake_path = "tests/data/packs/this_file_does_not_exist_123.pack";
     //     let result = Pack::stat_pack_file(fake_path);
-    //        
+    //
     //     assert!(result.is_err(), "文件不存在时应当返回GitError");
     //     assert!(
     //         result.unwrap_err().to_string().contains("系统找不到指定的文件"),
@@ -1298,13 +1432,13 @@ mod tests {
     // fn test_stat_pack_file_error_invalid_format() {
     //     let tmp_dir = std::env::temp_dir();
     //     let invalid_pack_path = tmp_dir.join("invalid_stat_test.pack");
-    //        
+    //
     //     // 写入非法头部
     //     let mut file = fs::File::create(&invalid_pack_path).unwrap();
     //     file.write_all(b"INVALID_PACK_HEADER_123456").unwrap();
     //
     //     let result = Pack::stat_pack_file(&invalid_pack_path);
-    //        
+    //
     //     assert!(result.is_err(), "文件格式非法时应当返回GitError");
     //     assert!(
     //         result.unwrap_err().to_string().contains("InvalidPackHeader"),
@@ -1324,7 +1458,7 @@ mod tests {
     //
     //     let stats_result = Pack::stats_pack_file_hook(&source);
     //     assert!(stats_result.is_ok(), "正常pack文件解析不应该报错");
-    //        
+    //
     //     let stats = stats_result.unwrap();
     //
     //     // 核心守恒断言
@@ -1333,10 +1467,10 @@ mod tests {
     //         stats.commits + stats.trees + stats.blobs + stats.tags,
     //         "复用Decode版：对象总数应该等于完整对象数量之和"
     //     );
-    //       
+    //
     //     assert!(stats.total > 0, "Pack文件中的对象总数不应该为0");
     //     assert!(stats.deltas >= 0, "Delta对象数量不能为负数");
-    //        
+    //
     //     // 打印结果方便调试
     //     println!("\n=== stats_pack_file_hook 测试结果 ===");
     //     println!("Pack File: {:?}", source.file_name().unwrap());
@@ -1360,10 +1494,9 @@ mod tests {
     //     file.write_all(b"WRONG_MAGIC_NUMBER_789").unwrap();
     //
     //     let result = Pack::stats_pack_file_hook(&invalid_pack_path);
-    //  
+    //
     //     assert!(result.is_err(), "文件格式非法时应当返回GitError");
     //
     //     fs::remove_file(invalid_pack_path).unwrap();
     // }
-
 }
